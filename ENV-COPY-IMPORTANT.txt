@@ -1,0 +1,9 @@
+PENTING
+
+Project final ini sengaja tidak menyertakan .env.local karena file tersebut berisi password MongoDB.
+
+Gunakan .env.local milik project EduCN yang saat ini sudah terbukti bisa terhubung ke Atlas. Copy file itu ke folder project final, di samping package.json.
+
+Jangan mengganti hostname yang sudah bekerja dan jangan menulis password di source code.
+
+MONGODB_DB_NAME tetap: educn_lms
