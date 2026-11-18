@@ -374,7 +374,7 @@ function ExcelImportModal({ type, open, onClose, onImported }: { type: "pengguna
       })).filter((row) => Object.values(row).some((value) => String(value).trim()));
       if (!mapped.length) { setError("Tidak ada baris data yang bisa dibaca."); return; }
       if (mapped.length > 1000) { setError("Maksimal 1.000 baris per sekali impor."); return; }
-      setFileName(file.name); setParsed(mapped);
+    setParsed(mapped as Record<string, string>[]);
     } catch { setError("File Excel tidak dapat dibaca. Pastikan file tidak rusak dan formatnya benar."); }
   };
   const submit = async () => {
