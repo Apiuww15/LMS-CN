@@ -1,0 +1,1103 @@
+import { getDb, getMongoClient } from "./mongodb";
+import { GridFSBucket, ObjectId } from "mongodb";
+import {
+  randomBytes,
+  randomUUID,
+  scrypt as scryptCallback,
+  timingSafeEqual,
+} from "node:crypto";
+import { promisify } from "node:util";
+
+export const COLLECTIONS = [
+  "users",
+  "guru",
+  "siswa",
+  "kelas",
+  "mapel",
+  "material",
+  "tasks",
+  "submissions",
+  "announcements",
+  "grades",
+  "attendance",
+  "schedules",
+  "reports",
+  "actions",
+] as const;
+
+export type CollectionName = (typeof COLLECTIONS)[number];
+
+export function isCollectionName(value: string): value is CollectionName {
+  return (COLLECTIONS as readonly string[]).includes(value);
+}
+
+function sanitizeDoc(doc: Record<string, unknown>) {
+  const { _id, passwordHash, password, ...safe } = doc;
+  void passwordHash;
+  void password;
+  return safe;
+}
+
+type RequestSession = {
+  userId: string;
+  email: string;
+  role: "admin" | "guru" | "siswa" | "kurikulum" | "kepsek";
+  nama: string;
+};
+
+async function getProfile(db: Awaited<ReturnType<typeof getDb>>, collection: "guru" | "siswa", session: RequestSession) {
+  return db.collection(collection).findOne({
+    $or: [{ userId: session.userId }, { email: session.email }, { id: session.userId }],
+  });
+}
+
+/**
+ * Return only records the signed-in account is allowed to see.
+ * School-wide read access is reserved for admin/kurikulum/kepsek.
+ */
+async function getReadFilter(name: CollectionName, session: RequestSession): Promise<Record<string, unknown>> {
+  if (name === "actions") return {};
+  if (["admin", "kurikulum", "kepsek"].includes(session.role)) return {};
+
+  const db = await getDb();
+  if (session.role === "guru") {
+    const profile = await getProfile(db, "guru", session);
+    const assignedClasses = Array.isArray(profile?.kelas)
+      ? profile.kelas.map((value: unknown) => String(value).trim()).filter(Boolean)
+      : String(profile?.kelas ?? "").split(",").map((value: string) => value.trim()).filter(Boolean);
+    const waliClassId = String(profile?.waliKelasId ?? "");
+    const waliClassDoc = waliClassId ? await db.collection("kelas").findOne({ id: waliClassId }) : null;
+    const assignedClassIds = [...new Set([waliClassId, String(profile?.kelasId ?? "")].filter(Boolean))];
+    const assignedClassNames = [...new Set([...assignedClasses, String(profile?.waliKelas ?? ""), String(waliClassDoc?.nama ?? "")].filter(Boolean))];
+    const ownContent = {
+      $or: [
+        { ownerId: session.userId }, { createdBy: session.userId },
+        { guruId: session.userId }, { userId: session.userId },
+        { ownerEmail: session.email }, { guruEmail: session.email },
+      ],
+    };
+
+    // Guru boleh melihat kelas yang memang ditugaskan kepadanya, bukan
+    // kelas milik guru lain hanya karena nama guru/wali kebetulan sama.
+    if (name === "kelas") {
+      return { $or: [{ waliUserId: session.userId }, { waliGuruId: String(profile?.id ?? "") }, ...(assignedClassIds.length ? [{ id: { $in: assignedClassIds } }] : []), ...(assignedClassNames.length ? [{ nama: { $in: assignedClassNames } }] : []), { ownerId: session.userId }] };
+    }
+    if (name === "siswa") {
+      const classes = await db.collection("kelas").find({ $or: [{ waliUserId: session.userId }, { waliGuruId: String(profile?.id ?? "") }, ...(assignedClassIds.length ? [{ id: { $in: assignedClassIds } }] : []), ...(assignedClassNames.length ? [{ nama: { $in: assignedClassNames } }] : [])] }).toArray();
+      const classNames = [...assignedClassNames, ...classes.map((item) => String(item.nama ?? item.namaKelas ?? ""))].filter(Boolean);
+      const classIds = [...assignedClassIds, ...classes.map((item) => String(item.id ?? ""))].filter(Boolean);
+      return classNames.length || classIds.length ? { $or: [...(classNames.length ? [{ kelas: { $in: [...new Set(classNames)] } }] : []), ...(classIds.length ? [{ kelasId: { $in: [...new Set(classIds)] } }] : [])] } : { _id: { $exists: false } };
+    }
+    if (name === "schedules") {
+      return { $or: [...(assignedClassIds.length ? [{ kelasId: { $in: assignedClassIds } }] : []), ...(assignedClassNames.length ? [{ kelas: { $in: assignedClassNames } }] : []), { guruId: session.userId }, { createdBy: session.userId }] };
+    }
+    if (name === "attendance") {
+      return { $or: [...(assignedClassIds.length ? [{ kelasId: { $in: assignedClassIds } }] : []), ...(assignedClassNames.length ? [{ kelas: { $in: assignedClassNames } }] : []), { ownerId: session.userId }, { createdBy: session.userId }] };
+    }
+    if (name === "submissions") {
+      const ownedTasks = await db.collection("tasks").find(ownContent, { projection: { id: 1 } }).toArray();
+      const taskIds = ownedTasks.map((task) => String(task.id));
+      return taskIds.length ? { taskId: { $in: taskIds } } : { _id: { $exists: false } };
+    }
+    if (["material", "tasks", "grades", "attendance", "schedules"].includes(name)) return ownContent;
+    if (name === "announcements") return {};
+    return { _id: { $exists: false } };
+  }
+
+  const profile = await getProfile(db, "siswa", session);
+  if (name === "siswa") {
+    return { $or: [{ userId: session.userId }, { id: String(profile?.id ?? "") }] };
+  }
+  if (name === "kelas") {
+    const className = String(profile?.kelas ?? ""); const classId = String(profile?.kelasId ?? "");
+    return classId || className ? { $or: [...(classId ? [{ id: classId }] : []), ...(className ? [{ nama: className }, { namaKelas: className }] : [])] } : { _id: { $exists: false } };
+  }
+  if (name === "submissions") return { studentUserId: session.userId };
+  if (["material", "tasks", "schedules"].includes(name)) {
+    const className = String(profile?.kelas ?? ""); const classId = String(profile?.kelasId ?? "");
+    return classId || className ? { $or: [...(classId ? [{ kelasId: classId }] : []), ...(className ? [{ kelas: className }] : [])] } : { _id: { $exists: false } };
+  }
+  if (name === "grades" || name === "attendance") {
+    const studentId = String(profile?.id ?? session.userId);
+    const nis = String(profile?.nis ?? "");
+    return { $or: [{ siswaId: studentId }, { siswaUserId: session.userId }, ...(nis ? [{ nis }] : [])] };
+  }
+  if (name === "announcements") return {};
+  return { _id: { $exists: false } };
+}
+
+async function syncProfilesFromUsers(db: Awaited<ReturnType<typeof getDb>>, users: Record<string, unknown>[], mongoSession: import("mongodb").ClientSession) {
+  const validIds = users.map((u) => String(u.id));
+  for (const user of users) {
+    const id = String(user.id);
+    const email = normalizeEmail(user.email);
+    const role = normalizeRoleLabel(user.role);
+    const target = role === "Guru" ? "guru" : role === "Siswa" ? "siswa" : null;
+    for (const collectionName of ["guru", "siswa"] as const) {
+      const collection = db.collection(collectionName);
+      if (collectionName !== target) {
+        await collection.deleteMany({ userId: id }, { session: mongoSession });
+        continue;
+      }
+      const old = await collection.findOne({ $or: [{ userId: id }, { email }] }, { session: mongoSession });
+      const profileId = String(old?.id ?? id);
+      const linkedFields: Record<string, unknown> = {
+        id: profileId, userId: id, nama: String(user.nama ?? ""), email,
+        status: String(user.status ?? "Aktif"),
+      };
+      const unsetFields: Record<string, ""> = {};
+      const allowedFields = collectionName === "guru"
+        ? (["nip", "mapel", "mapelId", "mapelIds", "kelas", "kelasId", "waliKelasId", "waliKelas"] as const)
+        : (["nis", "kelas", "kelasId", "jurusan"] as const);
+      for (const field of allowedFields) {
+        if (user[field] !== undefined && user[field] !== null && user[field] !== "") linkedFields[field] = user[field];
+        else unsetFields[field] = "";
+      }
+      await collection.updateOne(
+        { $or: [{ userId: id }, { email }] },
+        { $set: linkedFields, ...(Object.keys(unsetFields).length ? { $unset: unsetFields } : {}), $setOnInsert: { createdAt: new Date() } },
+        { upsert: true, session: mongoSession },
+      );
+    }
+  }
+  // Jangan menghapus profil legacy yang belum memiliki userId; hanya unlink
+  // profil yang jelas menunjuk akun yang sudah tidak ada.
+  await db.collection("guru").deleteMany({ userId: { $exists: true, $nin: validIds } }, { session: mongoSession });
+  await db.collection("siswa").deleteMany({ userId: { $exists: true, $nin: validIds } }, { session: mongoSession });
+}
+
+async function syncUsersFromProfiles(
+  db: Awaited<ReturnType<typeof getDb>>,
+  collectionName: "guru" | "siswa",
+  profiles: Record<string, unknown>[],
+  mongoSession: import("mongodb").ClientSession,
+  cleanupOrphans = true,
+) {
+  const role = collectionName === "guru" ? "Guru" : "Siswa";
+  const emails = profiles.map((profile) => normalizeEmail(profile.email)).filter(Boolean);
+  const duplicate = emails.find((email, index) => emails.indexOf(email) !== index);
+  if (duplicate) throw new Error(`Email ${role.toLowerCase()} duplikat: ${duplicate}`);
+
+  for (const profile of profiles) {
+    const requestedUserId = String(profile.userId ?? "").trim();
+    const profileEmail = normalizeEmail(profile.email);
+    const existingUser = await db.collection("users").findOne(
+      { $or: [...(requestedUserId ? [{ id: requestedUserId }] : []), ...(profileEmail ? [{ email: profileEmail }] : [])] },
+      { session: mongoSession },
+    );
+    const email = profileEmail || normalizeEmail(existingUser?.email);
+    // Older imported profiles may have neither an email nor a linked user.
+    // Keep them editable/deletable; newly created profiles are required by
+    // the UI to provide a valid email before they reach this synchronization.
+    if (!email) continue;
+    if (!isValidEmail(email)) {
+      throw new Error(`Email wajib diisi dengan format yang valid untuk data ${role.toLowerCase()}.`);
+    }
+
+    if (existingUser && normalizeRoleLabel(existingUser.role) !== role) {
+      throw new Error(`Email ${email} sudah terdaftar dengan peran ${String(existingUser.role)}.`);
+    }
+
+    const accountByRequestedId = requestedUserId
+      ? await db.collection("auth_accounts").findOne({ userId: requestedUserId }, { session: mongoSession })
+      : null;
+    const accountByEmail = await db.collection("auth_accounts").findOne({ email }, { session: mongoSession });
+    const existingAccount = accountByRequestedId ?? accountByEmail;
+    const userId = String(existingUser?.id ?? existingAccount?.userId ?? (requestedUserId || randomUUID()));
+
+    if (existingUser && String(existingUser.id) !== userId) {
+      throw new Error(`Email ${email} sudah digunakan pengguna lain.`);
+    }
+    if (existingAccount && String(existingAccount.userId) !== userId) {
+      throw new Error(`Email ${email} sudah terhubung ke akun lain.`);
+    }
+
+    const suppliedPassword = typeof profile.password === "string" ? profile.password.trim() : "";
+    const passwordHash = suppliedPassword
+      ? await hashPassword(suppliedPassword)
+      : typeof existingAccount?.passwordHash === "string"
+        ? existingAccount.passwordHash
+        : undefined;
+    // Deleting or editing another profile must not fail just because an older
+    // linked user has no auth_accounts document yet. A password is mandatory
+    // only when this operation is actually creating a brand-new user record.
+    if (!passwordHash && !existingUser) {
+      throw new Error(`Kata sandi wajib diisi saat membuat akun ${role.toLowerCase()} baru (${email}).`);
+    }
+
+    const user = {
+      id: userId,
+      nama: String(profile.nama ?? existingUser?.nama ?? ""),
+      email,
+      role,
+      status: String(profile.status ?? existingUser?.status ?? "Aktif"),
+      createdAt: existingUser?.createdAt ?? formatCreatedAt(undefined),
+      ...(collectionName === "guru"
+        ? { nip: String(profile.nip ?? ""), mapel: String(profile.mapel ?? ""), mapelId: String(profile.mapelId ?? ""), mapelIds: Array.isArray(profile.mapelIds) ? profile.mapelIds.map(String) : (profile.mapelId ? [String(profile.mapelId)] : []), kelas: String(profile.kelas ?? ""), kelasId: String(profile.kelasId ?? ""), waliKelasId: String(profile.waliKelasId ?? ""), waliKelas: String(profile.waliKelas ?? "") }
+        : { nis: String(profile.nis ?? ""), kelas: String(profile.kelas ?? ""), kelasId: String(profile.kelasId ?? ""), jurusan: String(profile.jurusan ?? "") }),
+    };
+
+    await db.collection("users").updateOne(
+      { id: userId },
+      {
+        $set: user,
+        $unset: collectionName === "guru"
+          ? { nis: "", jurusan: "" }
+          : { nip: "", mapel: "" },
+      },
+      { upsert: true, session: mongoSession },
+    );
+    // Keep existing auth credentials intact. Only create/update an auth
+    // account when a hash exists; profile deletion must never demand a new
+    // password for every remaining legacy profile.
+    if (passwordHash) {
+      await db.collection("auth_accounts").updateOne(
+        { userId },
+        {
+          $set: {
+            id: String(existingAccount?.id ?? `acc-${userId}`),
+            userId,
+            email,
+            role: collectionName,
+            status: user.status,
+            passwordHash,
+            updatedAt: new Date(),
+          },
+          $setOnInsert: { createdAt: new Date() },
+        },
+        { upsert: true, session: mongoSession },
+      );
+    } else if (existingAccount) {
+      await db.collection("auth_accounts").updateOne(
+        { userId },
+        { $set: { email, role: collectionName, status: user.status, updatedAt: new Date() } },
+        { session: mongoSession },
+      );
+    }
+    await db.collection(collectionName).updateOne(
+      { id: String(profile.id) },
+      { $set: { userId, email }, $unset: { password: "", passwordHash: "" } },
+      { session: mongoSession },
+    );
+    await db.collection(collectionName === "guru" ? "siswa" : "guru").deleteMany(
+      { userId },
+      { session: mongoSession },
+    );
+  }
+
+  // Cleanup orphan accounts for full profile replacement/deletion flows.
+  // Incremental Excel imports must not remove unrelated legacy accounts.
+  if (!cleanupOrphans) return;
+  const linkedProfiles = await db.collection(collectionName).find(
+    { userId: { $exists: true, $ne: "" } },
+    { session: mongoSession, projection: { userId: 1 } },
+  ).toArray();
+  const linkedIds = new Set(linkedProfiles.map((row) => String(row.userId)));
+  const roleUsers = await db.collection("users").find(
+    { role },
+    { session: mongoSession, projection: { id: 1 } },
+  ).toArray();
+  const orphanIds = roleUsers.map((row) => String(row.id)).filter((id) => !linkedIds.has(id));
+  if (orphanIds.length) {
+    await db.collection("users").deleteMany({ id: { $in: orphanIds } }, { session: mongoSession });
+    await db.collection("auth_accounts").deleteMany({ userId: { $in: orphanIds } }, { session: mongoSession });
+  }
+}
+
+
+
+/** Import many student/teacher profiles atomically and create their login accounts. */
+export async function importProfiles(
+  collectionName: "guru" | "siswa",
+  inputRows: Record<string, unknown>[],
+  session: RequestSession,
+) {
+  if (session.role !== "admin") throw new Error("Hanya administrator yang dapat mengimpor data.");
+  if (!Array.isArray(inputRows) || inputRows.length === 0) throw new Error("File Excel tidak berisi data.");
+  if (inputRows.length > 1000) throw new Error("Maksimal 1.000 baris per sekali impor.");
+
+  const db = await getDb();
+  const [classDocs, subjectDocs] = await Promise.all([db.collection("kelas").find({}).toArray(), db.collection("mapel").find({}).toArray()]);
+  const role = collectionName === "guru" ? "Guru" : "Siswa";
+  const idField = collectionName === "guru" ? "nip" : "nis";
+  const prepared: Record<string, unknown>[] = inputRows.map((row, index) => {
+    const nama = String(row.nama ?? "").trim(); const email = normalizeEmail(row.email); const password = String(row.password ?? "").trim();
+    const identity = String(row[idField] ?? "").trim(); const status = String(row.status ?? "Aktif").trim() || "Aktif";
+    const waliKelasName = String(row.waliKelas ?? (collectionName === "guru" ? row.kelas : "")).trim();
+    const studentClassName = String(row.kelas ?? "").trim(); const className = collectionName === "guru" ? waliKelasName : studentClassName;
+    const classDoc = className ? classDocs.find((item) => String(item.nama ?? item.namaKelas ?? "").trim().toLowerCase() === className.toLowerCase()) : null;
+    const mapelNames = String(row.mapel ?? "").split(",").map((value) => value.trim()).filter(Boolean);
+    const selectedSubjects = mapelNames.map((name) => subjectDocs.find((item) => String(item.nama ?? "").trim().toLowerCase() === name.toLowerCase())).filter(Boolean);
+    const missingSubjects = mapelNames.filter((name) => !selectedSubjects.some((item) => String(item?.nama ?? "").trim().toLowerCase() === name.toLowerCase()));
+    if (!nama || !identity || !email || !password || (collectionName === "siswa" && !studentClassName)) throw new Error(`Baris ${index + 2}: Nama, ${idField.toUpperCase()}, email, password${collectionName === "siswa" ? ", dan kelas" : ""} wajib diisi.`);
+    if (collectionName === "siswa" && !classDoc) throw new Error(`Baris ${index + 2}: kelas "${studentClassName}" belum dibuat. Gunakan kelas yang sudah ada.`);
+    if (collectionName === "guru" && waliKelasName && !classDoc) throw new Error(`Baris ${index + 2}: wali kelas "${waliKelasName}" belum dibuat.`);
+    if (!isValidEmail(email)) throw new Error(`Baris ${index + 2}: format email ${email} tidak valid.`);
+    if (password.length < 8) throw new Error(`Baris ${index + 2}: password minimal 8 karakter.`);
+    if (!( ["Aktif", "Non-aktif"].includes(status))) throw new Error(`Baris ${index + 2}: status harus Aktif atau Non-aktif.`);
+    if (collectionName === "guru" && !mapelNames.length) throw new Error(`Baris ${index + 2}: minimal satu mata pelajaran wajib untuk Guru.`);
+    if (collectionName === "guru" && missingSubjects.length) throw new Error(`Baris ${index + 2}: mata pelajaran belum dibuat: ${missingSubjects.join(", ")}.`);
+    if (collectionName === "siswa" && !String(row.jurusan ?? "").trim()) throw new Error(`Baris ${index + 2}: jurusan wajib diisi untuk siswa.`);
+    return {
+      ...row, id: randomUUID(), nama, email, password, status,
+      ...(collectionName === "guru" ? { nip: identity, mapel: selectedSubjects.map((item) => String(item?.nama ?? "")).join(", "), mapelIds: selectedSubjects.map((item) => String(item?.id ?? "")), mapelId: String(selectedSubjects[0]?.id ?? ""), kelas: String(classDoc?.nama ?? ""), kelasId: String(classDoc?.id ?? ""), waliKelas: String(classDoc?.nama ?? ""), waliKelasId: String(classDoc?.id ?? "") } : { nis: identity, kelas: String(classDoc?.nama ?? studentClassName), kelasId: String(classDoc?.id ?? ""), jurusan: String(row.jurusan ?? "").trim() }),
+    };
+  });
+
+  const duplicateInFile = (field: string) => {
+    const values = prepared.map((row) => String(row[field] ?? "").trim().toLowerCase());
+    return values.find((value, index) => value && values.indexOf(value) !== index);
+  };
+  const duplicateEmail = duplicateInFile("email");
+  const duplicateIdentity = duplicateInFile(idField);
+  if (duplicateEmail) throw new Error(`Email duplikat di file Excel: ${duplicateEmail}`);
+  if (duplicateIdentity) throw new Error(`${idField.toUpperCase()} duplikat di file Excel: ${duplicateIdentity}`);
+
+  const emails = prepared.map((row) => String(row.email));
+  const identities = prepared.map((row) => String(row[idField]));
+  const existingProfile = await db.collection(collectionName).findOne({ $or: [{ email: { $in: emails } }, { [idField]: { $in: identities } }] });
+  if (existingProfile) throw new Error(`Email atau ${idField.toUpperCase()} sudah terdaftar: ${String(existingProfile.email ?? existingProfile[idField] ?? "")}`);
+  const existingUser = await db.collection("users").findOne({ email: { $in: emails } });
+  if (existingUser) throw new Error(`Email sudah digunakan akun lain: ${String(existingUser.email)}`);
+  const existingAccount = await db.collection("auth_accounts").findOne({ email: { $in: emails } });
+  if (existingAccount) throw new Error(`Email sudah digunakan akun login lain: ${String(existingAccount.email)}`);
+
+  const safeProfiles = prepared.map(({ password: _password, ...row }) => ({ ...row, createdAt: new Date().toISOString() }));
+  const client = await getMongoClient();
+  const mongoSession = client.startSession();
+  try {
+    await mongoSession.withTransaction(async () => {
+      await db.collection(collectionName).insertMany(safeProfiles, { session: mongoSession });
+      await syncUsersFromProfiles(db, collectionName, prepared, mongoSession, false);
+      await syncClassStudentCounts(db, mongoSession);
+    });
+  } finally {
+    await mongoSession.endSession();
+  }
+  return safeProfiles;
+}
+
+
+export async function importUsers(inputRows: Record<string, unknown>[], session: RequestSession) {
+  if (session.role !== "admin") throw new Error("Hanya administrator yang dapat mengimpor akun pengguna.");
+  if (!Array.isArray(inputRows) || inputRows.length === 0) throw new Error("File Excel tidak berisi data.");
+  if (inputRows.length > 1000) throw new Error("Maksimal 1.000 baris per sekali impor.");
+
+  const db = await getDb();
+  const [classDocs, subjectDocs] = await Promise.all([db.collection("kelas").find({}).toArray(), db.collection("mapel").find({}).toArray()]);
+  const prepared = inputRows.map((row, index) => {
+    const nama = String(row.nama ?? "").trim();
+    const email = normalizeEmail(row.email);
+    const password = String(row.password ?? "").trim();
+    const roleLabel = normalizeRoleLabel(row.role);
+    const role = roleToAuthRole(roleLabel);
+    const status = String(row.status ?? "Aktif").trim() || "Aktif";
+    const nip = String(row.nip ?? "").trim(); const nis = String(row.nis ?? "").trim();
+    const mapel = String(row.mapel ?? "").trim();
+    const waliKelasName = String(row.waliKelas ?? (role === "guru" ? row.kelas : "")).trim();
+    const studentClassName = String(row.kelas ?? "").trim();
+    const className = role === "guru" ? waliKelasName : studentClassName;
+    const classDoc = className ? classDocs.find((item) => String(item.nama ?? item.namaKelas ?? "").trim().toLowerCase() === className.toLowerCase()) : null;
+    const subjectNames = mapel.split(",").map((value) => value.trim()).filter(Boolean);
+    const selectedSubjects = subjectNames.map((name) => subjectDocs.find((item) => String(item.nama ?? "").trim().toLowerCase() === name.toLowerCase())).filter(Boolean);
+    const missingSubjects = subjectNames.filter((name) => !selectedSubjects.some((item) => String(item?.nama ?? "").trim().toLowerCase() === name.toLowerCase()));
+    const jurusan = String(row.jurusan ?? "").trim().toUpperCase();
+    if (!nama || !email || !password || !roleLabel) throw new Error(`Baris ${index + 2}: Nama, Email, Password, dan Peran wajib diisi.`);
+    if (!isValidEmail(email)) throw new Error(`Baris ${index + 2}: format email ${email} tidak valid.`);
+    if (password.length < 8) throw new Error(`Baris ${index + 2}: password minimal 8 karakter.`);
+    if (!["Aktif", "Non-aktif"].includes(status)) throw new Error(`Baris ${index + 2}: status harus Aktif atau Non-aktif.`);
+    if (role === "guru" && (!nip || !subjectNames.length)) throw new Error(`Baris ${index + 2}: NIP dan minimal satu Mata Pelajaran wajib untuk Guru.`);
+    if (role === "siswa" && (!nis || !studentClassName || !jurusan)) throw new Error(`Baris ${index + 2}: NIS, Kelas, dan Jurusan wajib untuk Siswa.`);
+    if (role === "siswa" && !classDoc) throw new Error(`Baris ${index + 2}: kelas "${studentClassName}" belum dibuat.`);
+    if (role === "guru" && waliKelasName && !classDoc) throw new Error(`Baris ${index + 2}: wali kelas "${waliKelasName}" belum dibuat.`);
+    if (role === "guru" && missingSubjects.length) throw new Error(`Baris ${index + 2}: mata pelajaran belum dibuat: ${missingSubjects.join(", ")}.`);
+    if (role === "guru" && jurusan) throw new Error(`Baris ${index + 2}: kolom Jurusan hanya digunakan untuk Siswa.`);
+    if (role === "siswa" && (nip || mapel)) throw new Error(`Baris ${index + 2}: kolom NIP/Mata Pelajaran hanya digunakan untuk Guru.`);
+    return {
+      id: randomUUID(), nama, email, password, role: roleLabel, status,
+      ...(role === "siswa" ? { kelasId: String(classDoc?.id ?? ""), kelas: String(classDoc?.nama ?? studentClassName) } : {}),
+      ...(role === "guru" ? { nip, mapel: selectedSubjects.map((item) => String(item?.nama ?? "")).join(", "), mapelIds: selectedSubjects.map((item) => String(item?.id ?? "")), mapelId: String(selectedSubjects[0]?.id ?? ""), waliKelasId: String(classDoc?.id ?? ""), waliKelas: String(classDoc?.nama ?? ""), kelasId: String(classDoc?.id ?? ""), kelas: String(classDoc?.nama ?? "") } : {}),
+      ...(role === "siswa" ? { nis, jurusan } : {}),
+      createdAt: formatCreatedAt(undefined),
+    } as Record<string, unknown>;
+  });
+
+  const checkDuplicate = (field: string, label: string) => {
+    const values = prepared.map((row) => String(row[field] ?? "").trim().toLowerCase()).filter(Boolean);
+    const duplicate = values.find((value, index) => values.indexOf(value) !== index);
+    if (duplicate) throw new Error(`${label} duplikat di file Excel: ${duplicate}`);
+  };
+  checkDuplicate("email", "Email");
+  checkDuplicate("nip", "NIP");
+  checkDuplicate("nis", "NIS");
+
+  const emails = prepared.map((row) => String(row.email));
+  const identities = {
+    nip: prepared.map((row) => String(row.nip ?? "")).filter(Boolean),
+    nis: prepared.map((row) => String(row.nis ?? "")).filter(Boolean),
+  };
+  const [existingUser, existingAccount, existingGuru, existingSiswa] = await Promise.all([
+    db.collection("users").findOne({ email: { $in: emails } }),
+    db.collection("auth_accounts").findOne({ email: { $in: emails } }),
+    identities.nip.length ? db.collection("guru").findOne({ $or: [{ email: { $in: emails } }, { nip: { $in: identities.nip } }] }) : null,
+    identities.nis.length ? db.collection("siswa").findOne({ $or: [{ email: { $in: emails } }, { nis: { $in: identities.nis } }] }) : null,
+  ]);
+  const conflict = existingUser ?? existingAccount ?? existingGuru ?? existingSiswa;
+  if (conflict) throw new Error(`Email, NIP, atau NIS sudah terdaftar: ${String((conflict as Record<string, unknown>).email ?? (conflict as Record<string, unknown>).nip ?? (conflict as Record<string, unknown>).nis ?? "data lama")}`);
+
+  const safeRows = prepared.map(({ password: _password, ...row }) => row);
+  const accounts = await Promise.all(prepared.map(async (row) => ({
+    id: `acc-${String(row.id)}`, userId: String(row.id), email: String(row.email), role: roleToAuthRole(row.role),
+    status: String(row.status), passwordHash: await hashPassword(String(row.password)), createdAt: new Date(), updatedAt: new Date(),
+  })));
+  const client = await getMongoClient();
+  const mongoSession = client.startSession();
+  try {
+    await mongoSession.withTransaction(async () => {
+      if (safeRows.length) await db.collection("users").insertMany(safeRows, { session: mongoSession });
+      if (accounts.length) await db.collection("auth_accounts").insertMany(accounts, { session: mongoSession });
+      const guruProfiles = prepared.filter((row) => roleToAuthRole(row.role) === "guru").map((row) => ({
+        id: String(row.id), userId: String(row.id), nama: String(row.nama), email: String(row.email),
+        nip: String(row.nip), mapel: String(row.mapel), mapelId: String(row.mapelId ?? ""), mapelIds: Array.isArray(row.mapelIds) ? row.mapelIds.map(String) : [], kelas: String(row.kelas ?? ""), kelasId: String(row.kelasId ?? ""), waliKelasId: String(row.waliKelasId ?? ""), waliKelas: String(row.waliKelas ?? ""), status: String(row.status), createdAt: new Date(),
+      }));
+      const siswaProfiles = prepared.filter((row) => roleToAuthRole(row.role) === "siswa").map((row) => ({
+        id: String(row.id), userId: String(row.id), nama: String(row.nama), email: String(row.email),
+        nis: String(row.nis), kelas: String(row.kelas), kelasId: String(row.kelasId ?? ""), jurusan: String(row.jurusan), status: String(row.status), createdAt: new Date(),
+      }));
+      if (guruProfiles.length) await db.collection("guru").insertMany(guruProfiles, { session: mongoSession });
+      if (siswaProfiles.length) await db.collection("siswa").insertMany(siswaProfiles, { session: mongoSession });
+      await syncClassStudentCounts(db, mongoSession);
+    });
+  } finally {
+    await mongoSession.endSession();
+  }
+  return safeRows;
+}
+
+export async function listCollection(name: CollectionName, session: RequestSession) {
+  const db = await getDb();
+  const filter = await getReadFilter(name, session);
+  const docs = await db
+    .collection(name)
+    .find(filter, { projection: { passwordHash: 0, password: 0 } })
+    .sort({ _id: -1 })
+    .toArray();
+
+  const safeDocs = docs.map((doc) => {
+    const safe = sanitizeDoc(doc as Record<string, unknown>);
+    if (name === "announcements") { const { kategori: _legacyCategory, category: _legacyCategoryAlt, ...announcement } = safe; void _legacyCategory; void _legacyCategoryAlt; return announcement; }
+    return safe;
+  });
+  if (name === "announcements" && !["admin", "kurikulum", "kepsek"].includes(session.role)) {
+    const targetRole = session.role === "guru" ? "Guru" : session.role === "siswa" ? "Siswa" : "";
+    return safeDocs.filter((row) => {
+      const target = String(row.audience ?? "").trim().toLowerCase();
+      return target === "semua" || target === targetRole.toLowerCase();
+    });
+  }
+  return safeDocs;
+}
+
+function normalizeRoleLabel(value: unknown) {
+  const role = String(value ?? "").trim().toLowerCase();
+  const labels: Record<string, string> = {
+    admin: "Admin",
+    guru: "Guru",
+    siswa: "Siswa",
+    kurikulum: "Kurikulum",
+    kepsek: "Kepsek",
+  };
+  return labels[role] ?? String(value ?? "").trim();
+}
+
+const roleMap: Record<string, "admin" | "guru" | "siswa" | "kurikulum" | "kepsek"> = {
+  Admin: "admin", admin: "admin",
+  Guru: "guru", guru: "guru",
+  Siswa: "siswa", siswa: "siswa",
+  Kurikulum: "kurikulum", kurikulum: "kurikulum",
+  Kepsek: "kepsek", kepsek: "kepsek",
+};
+
+function roleToAuthRole(value: unknown) {
+  const role = String(value ?? "Siswa").trim();
+  const mapped = roleMap[role] ?? roleMap[role.toLowerCase()];
+  if (!mapped) throw new Error(`Peran pengguna tidak valid: ${role}`);
+  return mapped;
+}
+
+function formatCreatedAt(value: unknown) {
+  if (typeof value === "string" && value.trim()) return value;
+  return new Date().toLocaleDateString("id-ID", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+  });
+}
+
+function normalizeEmail(value: unknown) {
+  return String(value ?? "").trim().toLowerCase();
+}
+
+function isValidEmail(value: string) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
+}
+
+async function syncClassStudentCounts(db: Awaited<ReturnType<typeof getDb>>, mongoSession?: import("mongodb").ClientSession) {
+  const [classes, users, profiles] = await Promise.all([
+    db.collection("kelas").find({}, { session: mongoSession }).toArray(),
+    db.collection("users").find({}, { session: mongoSession }).toArray(),
+    db.collection("siswa").find({}, { session: mongoSession }).toArray(),
+  ]);
+  const counts = new Map<string, number>();
+  const enrolledUserIds = new Set<string>();
+  for (const user of users) {
+    if (normalizeRoleLabel(user.role) !== "Siswa") continue;
+    const userId = String(user.id ?? "");
+    if (userId) enrolledUserIds.add(userId);
+    const classId = String(user.kelasId ?? "");
+    const className = String(user.kelas ?? "").trim();
+    const key = classId || className;
+    if (key) counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  // Count legacy student profiles only when they are not already represented by a user.
+  for (const profile of profiles) {
+    const userId = String(profile.userId ?? "");
+    if (userId && enrolledUserIds.has(userId)) continue;
+    const key = String(profile.kelasId || profile.kelas || "").trim();
+    if (key) counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  for (const item of classes) {
+    const id = String(item.id ?? "");
+    const name = String(item.nama ?? item.namaKelas ?? "").trim();
+    const jumlah = counts.get(id) ?? counts.get(name) ?? 0;
+    await db.collection("kelas").updateOne({ _id: item._id }, { $set: { jumlah } }, { session: mongoSession });
+  }
+}
+
+export async function replaceCollection(
+  name: CollectionName,
+  rows: Record<string, unknown>[],
+  session: RequestSession,
+) {
+  const db = await getDb();
+  const collection = db.collection(name);
+
+  if (name !== "users") {
+    const withCredentials: Record<string, unknown>[] = rows.map((row) => ({
+      ...row,
+      id: String(row.id ?? randomUUID()),
+      ...(session.role === "guru" ? {
+        ownerId: session.userId,
+        ownerEmail: session.email,
+        createdBy: session.userId,
+        guruId: session.userId,
+        guruEmail: session.email,
+      } : {}),
+    }));
+    // Password hanya dipakai untuk membuat/memperbarui auth_accounts dan
+    // tidak pernah disimpan pada dokumen profil guru/siswa.
+    const normalized: Record<string, unknown>[] = withCredentials.map((row) => {
+      if (name !== "guru" && name !== "siswa") return row;
+      const { password: _password, passwordHash: _passwordHash, ...safe } = row;
+      void _password;
+      void _passwordHash;
+      return safe;
+    });
+
+    // Non-admin users may only replace their own records. Never run a
+    // collection-wide delete from a teacher/student session.
+    if (session.role === "guru") {
+      const allowedCollections = new Set(["material", "tasks", "grades", "attendance"]);
+      if (!allowedCollections.has(name)) throw new Error("Guru tidak diizinkan mengubah koleksi ini.");
+      const ownFilter = await getReadFilter(name, session);
+      const client = await getMongoClient();
+      const mongoSession = client.startSession();
+      try {
+        await mongoSession.withTransaction(async () => {
+          await collection.deleteMany(ownFilter, { session: mongoSession });
+          if (normalized.length) await collection.insertMany(normalized, { session: mongoSession });
+        });
+      } finally {
+        await mongoSession.endSession();
+      }
+      return normalized;
+    }
+
+    const roleCanWriteSpecial =
+      (session.role === "kurikulum" && ["mapel", "reports"].includes(name)) ||
+      (session.role === "kepsek" && name === "reports");
+    if (session.role !== "admin" && !roleCanWriteSpecial) {
+      throw new Error("Hanya administrator atau role yang diberi izin dapat mengubah koleksi ini.");
+    }
+
+    if (name === "kelas") {
+      const existingAssigned = await db.collection("users").find({ role: { $in: ["Siswa", "Guru", "siswa", "guru"] } }).toArray();
+      for (const user of existingAssigned) {
+        const assignedId = String(user.kelasId ?? "");
+        const assignedName = String(user.kelas ?? "").trim();
+        const stillExists = normalized.some((item) =>
+          (assignedId && String(item.id) === assignedId) ||
+          (assignedName && String(item.nama ?? item.namaKelas ?? "").trim() === assignedName),
+        );
+        if ((assignedId || assignedName) && !stillExists) {
+          throw new Error(`Kelas ${assignedName || assignedId} masih digunakan akun ${String(user.nama ?? user.email ?? "")}. Pindahkan akun tersebut terlebih dahulu.`);
+        }
+      }
+      const names = normalized.map((item) => String(item.nama ?? item.namaKelas ?? "").trim().toLowerCase()).filter(Boolean);
+      if (names.some((name, index) => names.indexOf(name) !== index)) throw new Error("Nama kelas tidak boleh duplikat.");
+      const waliIds = normalized.map((item) => String(item.waliGuruId ?? "")).filter(Boolean);
+      if (waliIds.some((waliId, index) => waliIds.indexOf(waliId) !== index)) throw new Error("Satu guru hanya dapat ditetapkan sebagai wali untuk satu kelas.");
+      const teacherProfiles = await db.collection("guru").find({}).toArray();
+      const unknownWali = waliIds.filter((waliId) => !teacherProfiles.some((teacher) => String(teacher.id ?? "") === waliId));
+      if (unknownWali.length) throw new Error("Wali kelas harus dipilih dari data akun Guru yang sudah dibuat.");
+    }
+    if (name === "mapel") {
+      const assignedTeachers = await db.collection("users").find({ role: { $in: ["Guru", "guru"] } }).toArray();
+      const oldSubjects = await collection.find({}).toArray();
+      const normalizedNames = normalized.map((item) => String(item.nama ?? "").trim().toLowerCase());
+      for (const teacher of assignedTeachers) {
+        const subjectIds = Array.isArray(teacher.mapelIds) ? teacher.mapelIds.map(String) : (teacher.mapelId ? [String(teacher.mapelId)] : []);
+        const subjectNames = String(teacher.mapel ?? "").split(",").map((value) => value.trim()).filter(Boolean);
+        const missingNames = subjectNames.filter((subjectName) => !normalizedNames.includes(subjectName.toLowerCase()));
+        const unresolvedIds = subjectIds.filter((subjectId) => {
+          if (normalized.some((item) => String(item.id ?? "") === subjectId)) return false;
+          const old = oldSubjects.find((item) => String(item.id ?? "") === subjectId);
+          const oldName = String(old?.nama ?? "").trim().toLowerCase();
+          return !oldName || !normalizedNames.includes(oldName);
+        });
+        // A stale teacher.mapelId must not block creating the subject by its
+        // existing legacy name (e.g. MTK). Only block when an assigned name
+        // truly disappears from the replacement list.
+        if (missingNames.length || (unresolvedIds.length && !subjectNames.length)) {
+          const missing = [...new Set([...missingNames, ...unresolvedIds])];
+          throw new Error(`Mata pelajaran ${missing.join(", ")} masih digunakan guru ${String(teacher.nama ?? teacher.email ?? "")}. Ubah penugasan guru terlebih dahulu.`);
+        }
+      }
+      const codes = normalized.map((item) => String(item.kode ?? "").trim().toLowerCase()).filter(Boolean);
+      if (codes.some((code, index) => codes.indexOf(code) !== index)) throw new Error("Kode mata pelajaran tidak boleh duplikat.");
+      const teacherDocs = await db.collection("guru").find({}).toArray();
+      for (const item of normalized) {
+        const ids = Array.isArray(item.guruIds) ? item.guruIds.map(String) : [];
+        const invalid = ids.filter((id) => !teacherDocs.some((teacher) => String(teacher.id ?? "") === id));
+        if (invalid.length) throw new Error("Guru pengampu harus dipilih dari data akun Guru yang sudah dibuat.");
+        const assigned = teacherDocs.filter((teacher) => ids.includes(String(teacher.id ?? "")));
+        item.guru = assigned.map((teacher) => String(teacher.nama ?? ""));
+      }
+    }
+
+    const client = await getMongoClient();
+    const mongoSession = client.startSession();
+    try {
+      await mongoSession.withTransaction(async () => {
+        await collection.deleteMany({}, { session: mongoSession });
+        if (normalized.length > 0) await collection.insertMany(normalized, { session: mongoSession });
+        if (name === "kelas") {
+          await db.collection("guru").updateMany({}, { $unset: { waliKelasId: "", waliKelas: "" } }, { session: mongoSession });
+          await db.collection("users").updateMany({ role: { $in: ["Guru", "guru"] } }, { $unset: { waliKelasId: "", waliKelas: "" } }, { session: mongoSession });
+          for (const item of normalized) {
+            const waliGuruId = String(item.waliGuruId ?? "");
+            const waliUserId = String(item.waliUserId ?? "");
+            const className = String(item.nama ?? item.namaKelas ?? "");
+            if (waliGuruId) {
+              await db.collection("guru").updateOne({ id: waliGuruId }, { $set: { waliKelasId: String(item.id), waliKelas: className } }, { session: mongoSession });
+            }
+            if (waliUserId) {
+              await db.collection("users").updateOne({ id: waliUserId }, { $set: { waliKelasId: String(item.id), waliKelas: className } }, { session: mongoSession });
+            }
+            const classId = String(item.id);
+            await db.collection("users").updateMany({ kelasId: classId }, { $set: { kelas: className } }, { session: mongoSession });
+            await db.collection("guru").updateMany({ kelasId: classId }, { $set: { kelas: className } }, { session: mongoSession });
+            await db.collection("siswa").updateMany({ kelasId: classId }, { $set: { kelas: className } }, { session: mongoSession });
+          }
+        }
+        if (name === "mapel") {
+          for (const item of normalized) {
+            const subjectId = String(item.id);
+            const subjectName = String(item.nama ?? "");
+            await db.collection("users").updateMany({ mapelId: subjectId }, { $set: { mapel: subjectName } }, { session: mongoSession });
+            await db.collection("guru").updateMany({ mapelId: subjectId }, { $set: { mapel: subjectName } }, { session: mongoSession });
+          }
+        }
+        if (name === "guru" || name === "siswa") {
+          await syncUsersFromProfiles(db, name, withCredentials, mongoSession);
+        }
+        if (name === "guru") {
+          const savedTeachers = await db.collection("guru").find({}, { session: mongoSession }).toArray();
+          await db.collection("kelas").updateMany({}, { $unset: { waliGuruId: "", waliUserId: "", wali: "" } }, { session: mongoSession });
+          for (const teacher of savedTeachers) {
+            const waliKelasId = String(teacher.waliKelasId ?? "");
+            if (!waliKelasId) continue;
+            await db.collection("kelas").updateOne({ id: waliKelasId }, { $set: { waliGuruId: String(teacher.id), waliUserId: String(teacher.userId ?? teacher.id), wali: String(teacher.nama ?? "") } }, { session: mongoSession });
+          }
+          const allSubjects = await db.collection("mapel").find({}, { session: mongoSession }).toArray();
+          for (const subject of allSubjects) {
+            const subjectId = String(subject.id ?? "");
+            const assigned = savedTeachers.filter((teacher) => (Array.isArray(teacher.mapelIds) ? teacher.mapelIds.map(String) : (teacher.mapelId ? [String(teacher.mapelId)] : [])).includes(subjectId));
+            await db.collection("mapel").updateOne({ _id: subject._id }, { $set: { guruIds: assigned.map((teacher) => String(teacher.id)), guru: assigned.map((teacher) => String(teacher.nama ?? "")) } }, { session: mongoSession });
+          }
+        }
+        if (name === "mapel") {
+          const savedSubjects = await db.collection("mapel").find({}, { session: mongoSession }).toArray();
+          const allTeachers = await db.collection("guru").find({}, { session: mongoSession }).toArray();
+          for (const teacher of allTeachers) {
+            const teacherId = String(teacher.id ?? "");
+            const assigned = savedSubjects.filter((subject) => (Array.isArray(subject.guruIds) ? subject.guruIds.map(String) : []).includes(teacherId));
+            const ids = assigned.map((subject) => String(subject.id));
+            const names = assigned.map((subject) => String(subject.nama ?? ""));
+            await db.collection("guru").updateOne({ _id: teacher._id }, { $set: { mapelIds: ids, mapelId: ids[0] || "", mapel: names.join(", ") } }, { session: mongoSession });
+            if (teacher.userId) await db.collection("users").updateOne({ id: String(teacher.userId) }, { $set: { mapelIds: ids, mapelId: ids[0] || "", mapel: names.join(", ") } }, { session: mongoSession });
+          }
+        }
+        if (name === "guru" || name === "siswa" || name === "kelas") {
+          await syncClassStudentCounts(db, mongoSession);
+        }
+      });
+    } finally {
+      await mongoSession.endSession();
+    }
+    return normalized;
+  }
+
+  /*
+   * User management is special because one UI save updates both
+   * users and auth_accounts. We validate everything BEFORE mutating,
+   * then use a MongoDB transaction so a failed account sync does not
+   * leave users half-saved.
+   */
+  const existingUsers = (await collection.find({}).toArray()).map(
+    (doc) => doc as Record<string, unknown>,
+  );
+
+  const accountsCollection = db.collection("auth_accounts");
+  const existingAccounts = (await accountsCollection.find({}).toArray()).map(
+    (doc) => doc as Record<string, unknown>,
+  );
+
+  const classDocs = await db.collection("kelas").find({}).toArray();
+  const subjectDocs = await db.collection("mapel").find({}).toArray();
+  const normalized: Record<string, unknown>[] = rows.map(
+    (row): Record<string, unknown> => {
+      const role = normalizeRoleLabel(row.role);
+      const className = String(row.kelas ?? "").trim();
+      const requestedClassDoc = classDocs.find((item) => String(item.id ?? "") === String(row.kelasId ?? ""))
+        ?? classDocs.find((item) => String(item.nama ?? item.namaKelas ?? "").trim() === className);
+      const requestedSubjectIds = Array.isArray(row.mapelIds) ? row.mapelIds.map(String) : (row.mapelId ? [String(row.mapelId)] : []);
+      const requestedSubjectNames = String(row.mapel ?? "").split(",").map((value) => value.trim()).filter(Boolean);
+      const selectedSubjects = requestedSubjectIds.length
+        ? subjectDocs.filter((item) => requestedSubjectIds.includes(String(item.id ?? "")))
+        : subjectDocs.filter((item) => requestedSubjectNames.includes(String(item.nama ?? "").trim()));
+      const missingSubjectIds = requestedSubjectIds.filter((id) => !selectedSubjects.some((item) => String(item.id ?? "") === id));
+      const subjectDoc = selectedSubjects[0];
+      const waliKelasId = String(row.waliKelasId ?? "").trim();
+      const waliClassDoc = waliKelasId ? classDocs.find((item) => String(item.id ?? "") === waliKelasId) : null;
+      if (role === "Siswa" && !requestedClassDoc) {
+        throw new Error(`Kelas "${className || String(row.kelasId || "")}" belum tersedia. Buat kelas terlebih dahulu lalu pilih dari daftar.`);
+      }
+      if (role === "Guru" && (!subjectDoc || missingSubjectIds.length)) {
+        throw new Error(`Mata pelajaran guru belum lengkap atau tidak tersedia. Buat mapel terlebih dahulu lalu pilih dari daftar.`);
+      }
+      if (role === "Guru" && waliKelasId && !waliClassDoc) throw new Error("Wali kelas harus dipilih dari data kelas yang sudah dibuat.");
+      const classDoc = role === "Guru" ? waliClassDoc : requestedClassDoc;
+      return {
+        ...row,
+        ...(classDoc ? { kelasId: String(classDoc.id), kelas: String(classDoc.nama ?? classDoc.namaKelas ?? "") } : role === "Guru" ? { kelasId: "", kelas: "" } : {}),
+        ...(role === "Guru" ? { mapelIds: selectedSubjects.map((item) => String(item.id)), mapelId: String(subjectDoc?.id ?? ""), mapel: selectedSubjects.map((item) => String(item.nama ?? "")).join(", "), waliKelasId, waliKelas: String(waliClassDoc?.nama ?? "") } : {}),
+        id: String(row.id ?? randomUUID()),
+        email: normalizeEmail(row.email),
+        role,
+        createdAt: formatCreatedAt(row.createdAt),
+      };
+    },
+  );
+
+  const emails = normalized
+    .map((row) => String(row.email ?? ""))
+    .filter(Boolean);
+
+  const badEmail = emails.find((email) => !isValidEmail(email));
+  if (badEmail) {
+    throw new Error(`Format email tidak valid: ${badEmail}`);
+  }
+
+  const duplicateEmails = emails.filter(
+    (email, index) => emails.indexOf(email) !== index,
+  );
+  if (duplicateEmails.length > 0) {
+    throw new Error(
+      `Email pengguna duplikat: ${[...new Set(duplicateEmails)].join(", ")}`,
+    );
+  }
+
+  const existingUserIds = new Set(
+    existingUsers.map((row) => String(row.id ?? "")),
+  );
+
+  const existingUserByEmail = new Map<string, Record<string, unknown>>();
+  for (const user of existingUsers) {
+    const email = normalizeEmail(user.email);
+    if (email) existingUserByEmail.set(email, user);
+  }
+
+  const accountByUserId = new Map<string, Record<string, unknown>>();
+  const accountByEmail = new Map<string, Record<string, unknown>>();
+  for (const account of existingAccounts) {
+    const userId = String(account.userId ?? "");
+    const email = normalizeEmail(account.email);
+    if (userId) accountByUserId.set(userId, account);
+    if (email) accountByEmail.set(email, account);
+  }
+
+  for (const row of normalized) {
+    const userId = String(row.id);
+    const email = String(row.email ?? "");
+    const password = typeof row.password === "string" ? row.password.trim() : "";
+    const existingUser = existingUserByEmail.get(email);
+
+    if (existingUser && String(existingUser.id) !== userId) {
+      throw new Error(`Email ${email} sudah digunakan pengguna lain.`);
+    }
+
+    const existingAccount = accountByUserId.get(userId) ?? accountByEmail.get(email);
+    const isNewUser = !existingUserIds.has(userId);
+
+    if (isNewUser && !existingAccount && !password) {
+      throw new Error(`Password wajib diisi untuk akun baru: ${email}`);
+    }
+  }
+
+  const safeRows = normalized.map((row) => {
+    const { password, passwordHash, ...safe } = row;
+    void password;
+    void passwordHash;
+    return safe;
+  });
+
+  const preparedAccounts: Array<Record<string, unknown>> = [];
+
+  for (const row of normalized) {
+    const userId = String(row.id);
+    const email = String(row.email ?? "");
+    const role = roleToAuthRole(row.role);
+    const status = String(row.status ?? "Aktif");
+    const password = typeof row.password === "string" ? row.password.trim() : "";
+    const existingAccount = accountByUserId.get(userId) ?? accountByEmail.get(email);
+
+    const passwordHash = password
+      ? await hashPassword(password)
+      : typeof existingAccount?.passwordHash === "string"
+        ? existingAccount.passwordHash
+        : undefined;
+
+    preparedAccounts.push({
+      id: String(existingAccount?.id ?? `acc-${userId}`),
+      userId,
+      email,
+      role,
+      status,
+      passwordHash,
+      createdAt: existingAccount?.createdAt ?? new Date(),
+      updatedAt: new Date(),
+      existingId: existingAccount?._id,
+    });
+  }
+
+  const client = await getMongoClient();
+  const mongoSession = client.startSession();
+
+  try {
+    await mongoSession.withTransaction(async () => {
+      await collection.deleteMany({}, { session: mongoSession });
+      if (safeRows.length > 0) {
+        await collection.insertMany(safeRows, { session: mongoSession });
+      }
+
+      const userIds = normalized.map((row) => String(row.id));
+
+      if (userIds.length > 0) {
+        await accountsCollection.deleteMany(
+          { userId: { $nin: userIds } },
+          { session: mongoSession },
+        );
+      } else {
+        await accountsCollection.deleteMany({}, { session: mongoSession });
+      }
+
+      for (const account of preparedAccounts) {
+        const { existingId, ...accountDoc } = account;
+        if (existingId) {
+          await accountsCollection.updateOne(
+            { _id: existingId },
+            { $set: accountDoc },
+            { session: mongoSession },
+          );
+        } else if (accountDoc.passwordHash) {
+          await accountsCollection.insertOne(accountDoc, { session: mongoSession });
+        }
+      }
+      await syncProfilesFromUsers(db, normalized, mongoSession);
+      const teacherProfiles = await db.collection("guru").find({}, { session: mongoSession }).toArray();
+      await db.collection("kelas").updateMany({}, { $unset: { waliGuruId: "", waliUserId: "", wali: "" } }, { session: mongoSession });
+      for (const teacher of teacherProfiles) {
+        const waliKelasId = String(teacher.waliKelasId ?? "");
+        if (!waliKelasId) continue;
+        await db.collection("kelas").updateOne({ id: waliKelasId }, { $set: { waliGuruId: String(teacher.id), waliUserId: String(teacher.userId ?? teacher.id), wali: String(teacher.nama ?? "") } }, { session: mongoSession });
+      }
+      const subjectProfiles = await db.collection("mapel").find({}, { session: mongoSession }).toArray();
+      for (const subject of subjectProfiles) {
+        const subjectId = String(subject.id ?? "");
+        const assigned = teacherProfiles.filter((teacher) => (Array.isArray(teacher.mapelIds) ? teacher.mapelIds.map(String) : (teacher.mapelId ? [String(teacher.mapelId)] : [])).includes(subjectId));
+        await db.collection("mapel").updateOne({ _id: subject._id }, { $set: { guruIds: assigned.map((teacher) => String(teacher.id)), guru: assigned.map((teacher) => String(teacher.nama ?? "")) } }, { session: mongoSession });
+      }
+      await syncClassStudentCounts(db, mongoSession);
+    });
+  } finally {
+    await mongoSession.endSession();
+  }
+
+  return safeRows;
+}
+
+export async function appendAction(action: {
+  id: string;
+  title: string;
+  detail: string;
+  time: string;
+}) {
+  const db = await getDb();
+  const actions = db.collection("actions");
+  await actions.insertOne(action);
+
+  const old = await actions
+    .find({}, { projection: { _id: 1 } })
+    .sort({ _id: -1 })
+    .skip(100)
+    .toArray();
+
+  if (old.length > 0) {
+    await actions.deleteMany({
+      _id: { $in: old.map((item) => item._id) },
+    });
+  }
+}
+
+const scrypt = promisify(scryptCallback);
+
+async function hashPassword(password: string) {
+  const salt = randomBytes(16).toString("hex");
+  const derived = (await scrypt(password, salt, 64)) as Buffer;
+  return `${salt}:${derived.toString("hex")}`;
+}
+
+async function verifyPassword(password: string, stored: string) {
+  const [salt, key] = stored.split(":");
+  if (!salt || !key) return false;
+
+  const derived = (await scrypt(password, salt, 64)) as Buffer;
+  const expected = Buffer.from(key, "hex");
+
+  return (
+    expected.length === derived.length &&
+    timingSafeEqual(expected, derived)
+  );
+}
+
+export { verifyPassword };
+
+
+/** Delete one teaching resource with ownership checks and dependent submissions cleanup. */
+export async function deleteTeachingRecord(
+  name: "material" | "tasks",
+  id: string,
+  session: RequestSession,
+) {
+  if (!id.trim()) throw new Error("ID data tidak valid.");
+  if (!["admin", "guru"].includes(session.role)) throw new Error("Kamu tidak memiliki izin menghapus data ini.");
+
+  const db = await getDb();
+  const collection = db.collection(name);
+  const ownerFilter = session.role === "admin"
+    ? { id }
+    : { id, $or: [{ ownerId: session.userId }, { createdBy: session.userId }, { guruId: session.userId }, { ownerEmail: session.email }, { guruEmail: session.email }] };
+  const record = await collection.findOne(ownerFilter);
+  if (!record) throw new Error("Data tidak ditemukan atau bukan milik akun kamu.");
+
+  const client = await getMongoClient();
+  const mongoSession = client.startSession();
+  try {
+    await mongoSession.withTransaction(async () => {
+      await collection.deleteOne({ _id: record._id }, { session: mongoSession });
+      if (name === "tasks") {
+        await db.collection("submissions").deleteMany({ taskId: id }, { session: mongoSession });
+      }
+    });
+  } finally {
+    await mongoSession.endSession();
+  }
+
+  // Remove GridFS attachments after the record transaction succeeds. A file
+  // cleanup failure is logged but never restores a task that was deleted.
+  const bucket = new GridFSBucket(db, { bucketName: "educn_files" });
+  const fileDocs = name === "material"
+    ? await db.collection("educn_files.files").find({ "metadata.purpose": "material", "metadata.recordId": id }, { projection: { _id: 1 } }).toArray()
+    : await db.collection("educn_files.files").find({ $or: [
+        { "metadata.purpose": "task", "metadata.recordId": id },
+        { "metadata.purpose": "submission", "metadata.taskId": id },
+      ] }, { projection: { _id: 1 } }).toArray();
+  for (const file of fileDocs) {
+    try { await bucket.delete(file._id as ObjectId); }
+    catch (error) { console.warn("GridFS cleanup failed", String(file._id), error); }
+  }
+  return { id, deleted: true };
+}
+
+
+/** Delete a class safely, reassigning linked accounts to a replacement class when needed. */
+export async function deleteClassRecord(id: string, replacementClassId: string | undefined, session: RequestSession) {
+  if (session.role !== "admin") throw new Error("Hanya administrator yang dapat menghapus kelas.");
+  if (!id.trim()) throw new Error("ID kelas tidak valid.");
+  const db = await getDb();
+  const classDoc = await db.collection("kelas").findOne({ id });
+  if (!classDoc) throw new Error("Kelas tidak ditemukan.");
+  const oldName = String(classDoc.nama ?? classDoc.namaKelas ?? "").trim();
+  const classRefs = [{ kelasId: id }, ...(oldName ? [{ kelas: oldName }] : [])];
+  const [accounts, teacherProfiles, studentProfiles] = await Promise.all([
+    db.collection("users").find({ $or: classRefs }).toArray(),
+    db.collection("guru").find({ $or: classRefs }).toArray(),
+    db.collection("siswa").find({ $or: classRefs }).toArray(),
+  ]);
+  const linkedCount = Math.max(
+    accounts.filter((u) => ["Guru", "Siswa", "guru", "siswa"].includes(String(u.role))).length,
+    teacherProfiles.length + studentProfiles.length,
+  );
+  const hasLinkedRecords = linkedCount > 0;
+  let replacement: Record<string, unknown> | null = null;
+  if (hasLinkedRecords) {
+    if (!replacementClassId) {
+      const alternatives = await db.collection("kelas").find({ id: { $ne: id } }, { projection: { id: 1, nama: 1, namaKelas: 1 } }).toArray();
+      const error = new Error("CLASS_IN_USE");
+      Object.assign(error, { linkedCount, alternatives: alternatives.map((c) => ({ id: String(c.id), nama: String(c.nama ?? c.namaKelas ?? "") })) });
+      throw error;
+    }
+    replacement = replacementClassId === id ? null : await db.collection("kelas").findOne({ id: replacementClassId });
+    if (!replacement) throw new Error("Kelas pengganti tidak valid.");
+  }
+  const client = await getMongoClient();
+  const mongoSession = client.startSession();
+  try {
+    await mongoSession.withTransaction(async () => {
+      if (replacement) {
+        const newId = String(replacement!.id);
+        const newName = String(replacement!.nama ?? replacement!.namaKelas ?? "");
+        const classFilter = { $or: classRefs };
+        for (const collectionName of ["users", "guru", "siswa"]) {
+          await db.collection(collectionName).updateMany(classFilter, { $set: { kelasId: newId, kelas: newName } }, { session: mongoSession });
+        }
+      }
+      await db.collection("kelas").deleteOne({ _id: classDoc._id }, { session: mongoSession });
+      await syncClassStudentCounts(db, mongoSession);
+    });
+  } finally {
+    await mongoSession.endSession();
+  }
+  return { id, deleted: true, reassigned: linkedCount, replacementClass: replacement ? String(replacement.nama ?? replacement.namaKelas ?? "") : null };
+}
