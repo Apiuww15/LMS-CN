@@ -1033,3 +1033,23 @@ html,body{max-width:100%;overflow-x:clip}
 @media(max-width:430px){.announcement-hero-art{display:none}.announcement-hero h3{font-size:27px}.student-class-hero{display:block}.student-class-emblem{display:none}.student-class-tags{gap:6px}.student-class-tags span{font-size:9px;padding:8px 9px}.student-class-info-card{padding:15px}.student-class-roster-head{align-items:flex-start;flex-direction:column}.announcement-card-top{align-items:flex-start;flex-direction:column}.announcement-date{font-size:9px}}
 @media(prefers-reduced-motion:reduce){.announcement-hero-orb,.announcement-art-sheet,.student-class-glow{animation:none!important}.announcement-card-modern:hover .announcement-poster img{transform:none}}
 .student-class-detail-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.student-class-detail-grid>div{display:grid;gap:6px;padding:14px;border-radius:15px;background:#f7fbf8;border:1px solid #edf3ef}.student-class-detail-grid small{font-size:9px;font-weight:900;letter-spacing:.08em;color:#87958d}.student-class-detail-grid b{font-size:12px;overflow-wrap:anywhere;color:#294a3b}.student-class-note .student-class-count{display:inline-flex;align-items:center;gap:6px}@media(max-width:760px){.student-class-detail-grid{grid-template-columns:1fr}}
+
+
+/* Mobile-only fix: keep page headers left-aligned and content-height on narrow screens.
+   The global flex-basis/alignment below is intended for desktop and must not affect mobile. */
+@media (max-width: 760px) {
+  .page-header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .page-header > div:first-child {
+    flex: 0 1 auto;
+    width: 100%;
+    min-width: 0;
+  }
+
+  .page-header > :last-child {
+    max-width: 100%;
+  }
+}
