@@ -31,7 +31,7 @@ function authorize(collection: string, role: string, write = false) {
   if (collection === "attendance") return ["admin", "guru"].includes(role);
   if (collection === "schedules") return role === "admin";
   if (collection === "reports") return ["admin", "kurikulum", "kepsek"].includes(role);
-  if (collection === "announcements") return ["admin", "guru", "kurikulum"].includes(role);
+  if (collection === "announcements") return role === "admin";
   return false;
 }
 
