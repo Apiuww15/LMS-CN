@@ -5,7 +5,7 @@ import { getSession } from "@/lib/auth";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-const writers = ["admin", "guru", "kurikulum"];
+const writers = ["admin"];
 
 export async function POST(request: Request) {
   try {
