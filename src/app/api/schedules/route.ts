@@ -28,9 +28,9 @@ export async function POST(request: Request) {
     }
     const teacherProfileId = String(teacher.id ?? "");
     const teacherUserId = String(teacher.userId ?? teacher.id ?? "");
-    const assignedIds = Array.isArray(teacher.mapelIds) ? teacher.mapelIds.map(String) : (teacher.mapelId ? [String(teacher.mapelId)] : []);
-    const subjectTeacherIds = Array.isArray(mapel.guruIds) ? mapel.guruIds.map(String) : [];
-    if (!assignedIds.includes(mapelId) && !subjectTeacherIds.includes(teacherProfileId)) return NextResponse.json({ error: "Guru tersebut belum ditugaskan mengampu mata pelajaran ini." }, { status: 400 });
+    const assignments = Array.isArray(teacher.teachingAssignments) ? teacher.teachingAssignments : [];
+    const hasExactAssignment = assignments.some((assignment: any) => String(assignment.mapelId) === mapelId && Array.isArray(assignment.kelasIds) && assignment.kelasIds.map(String).includes(kelasId));
+    if (!hasExactAssignment) return NextResponse.json({ error: "Guru tersebut belum ditugaskan untuk mata pelajaran dan kelas yang dipilih. Periksa penugasan guru." }, { status: 400 });
     const jam = `${jamMulai} - ${jamSelesai}`;
     const duplicate = await db.collection("schedules").findOne({ hari, kelasId, jamMulai, jamSelesai });
     if (duplicate) return NextResponse.json({ error: "Jadwal pada kelas, hari, dan jam tersebut sudah ada." }, { status: 409 });
